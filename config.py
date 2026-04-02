@@ -23,7 +23,8 @@ class Settings(BaseSettings):
 
     # ── AI 분석 (Claude API) ──────────────────────────────
     ANTHROPIC_API_KEY: str = ""
-    CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
+    # ★ 수정: claude-sonnet-4-20250514(구버전) → claude-sonnet-4-6(최신)
+    CLAUDE_MODEL: str = "claude-sonnet-4-6"
 
     # ── AI 분석 (OpenAI API) ──────────────────────────────
     OPENAI_API_KEY: str = ""

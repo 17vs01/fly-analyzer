@@ -1,6 +1,6 @@
 """
 services/ai_providers/claude_analyzer.py - Claude Vision API 분석기
-사진 전체(벌레 + 배경 오염원)를 동시에 분석하는 멀티모달 로직
+★ 수정: anthropic.AsyncAnthropic 사용 → asyncio.gather 진짜 병렬 실행
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from .base import BaseAnalyzer, DetectedHabitat, ProviderResult
 
 logger = logging.getLogger(__name__)
 
-# ── Claude에게 보내는 분석 지시문 ──────────────────────────────────────────────
 SYSTEM_PROMPT = """당신은 초파리류 해충 분류 전문가입니다.
 사용자가 보내는 사진을 분석하여 아래 JSON 형식으로만 응답하세요.
 다른 설명이나 마크다운 없이 순수 JSON만 출력하세요.
@@ -39,7 +38,7 @@ SYSTEM_PROMPT = """당신은 초파리류 해충 분류 전문가입니다.
 
 
 class ClaudeAnalyzer(BaseAnalyzer):
-    """Claude Vision API를 사용하는 분석기"""
+    """Claude Vision API를 사용하는 분석기 (비동기)"""
 
     @property
     def provider_name(self) -> str:
@@ -50,13 +49,11 @@ class ClaudeAnalyzer(BaseAnalyzer):
             return self._make_error_result("ANTHROPIC_API_KEY가 설정되지 않았습니다.")
 
         try:
-            client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+            # ★ AsyncAnthropic 사용 → 이벤트 루프 안 막음
+            client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
-            # 이미지를 base64로 인코딩
             image_data = self._encode_image_base64(image_path)
             media_type = self._get_media_type(image_path)
-
-            # DB의 해충 정보를 프롬프트에 포함 (분류 정확도 향상)
             pest_list_str = self._format_pest_context(pest_context)
 
             user_message = f"""다음 사진을 분석해 주세요.
@@ -69,7 +66,8 @@ class ClaudeAnalyzer(BaseAnalyzer):
 2. 사진 배경에 있는 오염원(배수구, 음식물, 화분 등)도 함께 확인하세요
 3. 불확실하면 여러 후보를 confidence 순으로 나열하세요"""
 
-            response = client.messages.create(
+            # ★ await 추가
+            response = await client.messages.create(
                 model=settings.CLAUDE_MODEL,
                 max_tokens=1024,
                 system=SYSTEM_PROMPT,
@@ -104,8 +102,13 @@ class ClaudeAnalyzer(BaseAnalyzer):
     def _parse_response(self, raw_text: str) -> ProviderResult:
         """Claude JSON 응답을 ProviderResult로 변환"""
         try:
-            # JSON 파싱 (백틱 마크다운이 붙어 있을 경우 제거)
-            clean = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            clean = (
+                raw_text.strip()
+                .removeprefix("```json")
+                .removeprefix("```")
+                .removesuffix("```")
+                .strip()
+            )
             data = json.loads(clean)
 
             habitats = [
@@ -131,7 +134,6 @@ class ClaudeAnalyzer(BaseAnalyzer):
             return self._make_error_result(f"응답 파싱 실패: {e}")
 
     def _format_pest_context(self, pest_context: dict) -> str:
-        """DB 해충 정보를 프롬프트용 문자열로 변환"""
         lines = []
         for p in pest_context.get("pests", []):
             features = ", ".join(p.get("visual_features") or [])

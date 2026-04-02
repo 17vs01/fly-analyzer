@@ -1,13 +1,13 @@
 """
 services/ai_providers/openai_analyzer.py - OpenAI GPT-4o Vision 분석기
-Claude와 동일한 프롬프트 구조, 교차 검증용
+★ 수정: AsyncOpenAI 사용 → asyncio.gather 진짜 병렬 실행
 """
 from __future__ import annotations
 
 import json
 import logging
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from config import settings
 from .base import BaseAnalyzer, DetectedHabitat, ProviderResult
@@ -38,7 +38,7 @@ SYSTEM_PROMPT = """당신은 초파리류 해충 분류 전문가입니다.
 
 
 class OpenAIAnalyzer(BaseAnalyzer):
-    """GPT-4o Vision API를 사용하는 분석기"""
+    """GPT-4o Vision API를 사용하는 분석기 (비동기)"""
 
     @property
     def provider_name(self) -> str:
@@ -49,7 +49,8 @@ class OpenAIAnalyzer(BaseAnalyzer):
             return self._make_error_result("OPENAI_API_KEY가 설정되지 않았습니다.")
 
         try:
-            client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            # ★ AsyncOpenAI 사용 → 이벤트 루프 안 막음
+            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
             image_data = self._encode_image_base64(image_path)
             media_type = self._get_media_type(image_path)
@@ -65,7 +66,8 @@ class OpenAIAnalyzer(BaseAnalyzer):
 2. 사진 배경에 있는 오염원(배수구, 음식물, 화분 등)도 함께 확인하세요
 3. 불확실하면 여러 후보를 confidence 순으로 나열하세요"""
 
-            response = client.chat.completions.create(
+            # ★ await 추가
+            response = await client.chat.completions.create(
                 model=settings.OPENAI_MODEL,
                 max_tokens=1024,
                 messages=[
@@ -77,7 +79,7 @@ class OpenAIAnalyzer(BaseAnalyzer):
                                 "type": "image_url",
                                 "image_url": {
                                     "url": f"data:{media_type};base64,{image_data}",
-                                    "detail": "high",  # 고해상도 분석
+                                    "detail": "high",
                                 },
                             },
                             {"type": "text", "text": user_message},
@@ -95,7 +97,13 @@ class OpenAIAnalyzer(BaseAnalyzer):
 
     def _parse_response(self, raw_text: str) -> ProviderResult:
         try:
-            clean = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            clean = (
+                raw_text.strip()
+                .removeprefix("```json")
+                .removeprefix("```")
+                .removesuffix("```")
+                .strip()
+            )
             data = json.loads(clean)
 
             habitats = [

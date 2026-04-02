@@ -1,23 +1,19 @@
 """
-services/report_generator.py - Pest control report generator
+services/report_generator.py - 방역 보고서 생성기
 
-Generates both structured JSON and PDF reports from analysis results.
-Priority rule: user knowledge (High) > literature (Low)
+★ 수정: build()에서 report.pest (lazy 관계) 직접 접근 제거
+        → async SQLAlchemy MissingGreenlet 에러 방지
+        → caller(routers/report.py)가 pest_name_ko를 주입하는 방식 유지
 """
 from __future__ import annotations
 
-import io
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 
 from fpdf import FPDF
 
 logger = logging.getLogger(__name__)
-
-# PDF font path - uses built-in fonts (no Korean support needed for PDF)
-# Korean text is handled via UTF-8 JSON response
 
 
 @dataclass
@@ -28,42 +24,42 @@ class ReportSection:
 
 @dataclass
 class FullReport:
-    """Structured report data - used for both JSON and PDF output"""
+    """구조화된 보고서 데이터 - JSON/PDF 출력에 모두 사용"""
     report_id: int
     created_at: str
 
-    # Pest info
     pest_name_ko: str
     pest_confidence: float
     pest_candidates: list[dict]
 
-    # Habitat info
     detected_habitats: list[dict]
 
-    # Actions (3 levels)
-    immediate_actions: list[str]       # Do right now
-    short_term_actions: list[str]      # Within 1 week
-    long_term_actions: list[str]       # Within 1 month
+    immediate_actions: list[str]
+    short_term_actions: list[str]
+    long_term_actions: list[str]
 
-    # User knowledge applied
     applied_knowledge: list[dict]
 
-    # Summary
     summary_text: str
-    risk_level: str                    # LOW / MEDIUM / HIGH / CRITICAL
+    risk_level: str          # LOW / MEDIUM / HIGH / CRITICAL
     is_low_confidence: bool
 
 
 class ReportGenerator:
     """
-    Converts AnalysisReport DB record into FullReport
-    and renders it as JSON dict or PDF bytes.
+    AnalysisReport DB 레코드 → FullReport 변환 후 JSON/PDF 렌더링.
+
+    pest_name_ko 주입 방법:
+      full = report_generator.build(report)
+      if pest:
+          full.pest_name_ko = pest.name_ko   ← caller가 직접 설정
     """
 
     def build(self, report) -> FullReport:
         """
-        Build FullReport from AnalysisReport ORM object.
-        Called after analysis is complete (status == completed).
+        AnalysisReport ORM 객체로 FullReport 생성.
+        ★ report.pest 관계에 절대 접근하지 않음 (async lazy 로드 불가)
+           pest_name_ko 는 caller가 나중에 주입.
         """
         risk_level = self._calc_risk_level(
             habitats=report.detected_habitats or [],
@@ -72,9 +68,13 @@ class ReportGenerator:
 
         return FullReport(
             report_id=report.id,
-            created_at=report.completed_at.strftime("%Y-%m-%d %H:%M")
-            if report.completed_at else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-            pest_name_ko=report.pest_id and report.pest.name_ko if hasattr(report, "pest") and report.pest else "",
+            created_at=(
+                report.completed_at.strftime("%Y-%m-%d %H:%M")
+                if report.completed_at
+                else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+            ),
+            # ★ 기본값 "" → caller(routers/report.py)에서 pest.name_ko 로 덮어씀
+            pest_name_ko="",
             pest_confidence=report.pest_confidence or 0.0,
             pest_candidates=report.pest_candidates or [],
             detected_habitats=report.detected_habitats or [],
@@ -88,7 +88,7 @@ class ReportGenerator:
         )
 
     def to_dict(self, full_report: FullReport) -> dict:
-        """Export FullReport as JSON-serializable dict"""
+        """FullReport → JSON 직렬화 가능한 dict"""
         return {
             "report_id": full_report.report_id,
             "created_at": full_report.created_at,
@@ -112,27 +112,17 @@ class ReportGenerator:
         }
 
     def to_pdf(self, full_report: FullReport, pest_obj=None) -> bytes:
-        """
-        Render FullReport as PDF bytes.
-        Uses FPDF2 with built-in Latin fonts.
-        Korean characters are transliterated to English labels.
-        """
+        """FullReport → PDF bytes (FPDF2, 영문 라틴 폰트)"""
         pdf = _FlyAnalyzerPDF()
         pdf.set_auto_page_break(auto=True, margin=20)
         pdf.add_page()
 
-        # ── Cover ──────────────────────────────────────────
         pdf.cover_section(full_report)
-
-        # ── Risk Badge ────────────────────────────────────
         pdf.risk_badge(full_report.risk_level)
 
-        # ── Pest Result ───────────────────────────────────
         pdf.section_header("1. Pest Identification")
-
         pest_display = full_report.pest_name_ko or "Unknown"
         conf_pct = f"{full_report.pest_confidence:.0%}"
-
         pdf.key_value("Identified Species", f"{pest_display}  (confidence: {conf_pct})")
 
         if full_report.is_low_confidence:
@@ -154,9 +144,7 @@ class ReportGenerator:
             if pest_obj.lifecycle_days:
                 pdf.key_value("Lifecycle", f"{pest_obj.lifecycle_days} days (egg to adult)")
 
-        # ── Habitats ──────────────────────────────────────
         pdf.section_header("2. Detected Contamination Sources")
-
         if full_report.detected_habitats:
             for h in full_report.detected_habitats:
                 name = h.get("name_ko", "Unknown")
@@ -165,9 +153,7 @@ class ReportGenerator:
         else:
             pdf.normal_text("No contamination sources detected in image.")
 
-        # ── Action Plan ───────────────────────────────────
         pdf.section_header("3. Pest Control Action Plan")
-
         if full_report.applied_knowledge:
             pdf.info_box(
                 f"* Field-verified knowledge applied: {len(full_report.applied_knowledge)} item(s)\n"
@@ -182,16 +168,13 @@ class ReportGenerator:
             pdf.normal_text("No immediate actions required.")
 
         pdf.sub_header("Short-term Actions (Within 1 Week)")
-        if full_report.short_term_actions:
-            for a in full_report.short_term_actions:
-                pdf.bullet_item(a)
+        for a in full_report.short_term_actions:
+            pdf.bullet_item(a)
 
         pdf.sub_header("Long-term Actions (Within 1 Month)")
-        if full_report.long_term_actions:
-            for a in full_report.long_term_actions:
-                pdf.bullet_item(a)
+        for a in full_report.long_term_actions:
+            pdf.bullet_item(a)
 
-        # ── Applied Knowledge ─────────────────────────────
         if full_report.applied_knowledge:
             pdf.section_header("4. Field Expert Knowledge Applied")
             pdf.info_box("The following user-input knowledge was prioritized in this report.")
@@ -205,7 +188,6 @@ class ReportGenerator:
                     f"(relevance: {rel:.0%}, confidence: {conf:.0%})"
                 )
 
-        # ── Footer note ───────────────────────────────────
         pdf.ln(10)
         pdf.set_font("Helvetica", "I", 8)
         pdf.set_text_color(150, 150, 150)
@@ -217,19 +199,13 @@ class ReportGenerator:
 
         return bytes(pdf.output())
 
-    # ── Internal helpers ──────────────────────────────────
+    # ── 내부 헬퍼 ─────────────────────────────────────────────
 
     def _calc_risk_level(self, habitats: list[dict], confidence: float) -> str:
-        """
-        Risk level based on habitat count and confidence.
-        CRITICAL > HIGH > MEDIUM > LOW
-        """
         if not habitats:
             return "LOW"
-
         max_risk = max((h.get("confidence", 0) for h in habitats), default=0)
         count = len(habitats)
-
         if count >= 3 or max_risk >= 0.9:
             return "CRITICAL"
         if count >= 2 or max_risk >= 0.7:
@@ -239,13 +215,13 @@ class ReportGenerator:
         return "LOW"
 
 
-# ── PDF renderer class ──────────────────────────────────────────────────────
+# ── PDF 렌더러 ────────────────────────────────────────────────
 
 RISK_COLORS = {
-    "LOW":      (39,  174, 96),
-    "MEDIUM":   (241, 196, 15),
-    "HIGH":     (230, 126, 34),
-    "CRITICAL": (192, 57,  43),
+    "LOW":      (39,  174,  96),
+    "MEDIUM":   (241, 196,  15),
+    "HIGH":     (230, 126,  34),
+    "CRITICAL": (192,  57,  43),
 }
 
 LM = 15  # left margin
@@ -253,10 +229,8 @@ RM = 15  # right margin
 
 
 class _FlyAnalyzerPDF(FPDF):
-    """Custom PDF - always resets x to left margin before drawing"""
 
     def _x(self):
-        """Always draw from left margin"""
         self.set_x(LM)
 
     def header(self):
@@ -331,8 +305,7 @@ class _FlyAnalyzerPDF(FPDF):
         self.set_text_color(30, 30, 30)
         self.cell(50, 7, key + ":")
         self.set_font("Helvetica", "", 10)
-        w = self.epw - 50
-        self.multi_cell(w, 7, value)
+        self.multi_cell(self.epw - 50, 7, value)
 
     def bullet_item(self, text: str):
         self._x()
@@ -367,5 +340,5 @@ class _FlyAnalyzerPDF(FPDF):
         self.set_fill_color(255, 255, 255)
 
 
-# Singleton
+# 싱글톤
 report_generator = ReportGenerator()
